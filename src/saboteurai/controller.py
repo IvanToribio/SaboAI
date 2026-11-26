@@ -155,6 +155,33 @@ def _conversation(ask, turn, game, messages, notify):
         notify({'kind': 'speech', 'speaker': speaker, 'text': published})
 
 
+_ACTION_REPLY = re.compile(
+    r'(?P<label>(?:respuesta|opci[oó]n|acci[oó]n)(?:\s*:\s*|\s+)'
+    r'|(?:la respuesta(?: correcta)? es|elijo(?: la opci[oó]n)?)\s+)?'
+    r'(?P<number>[1-9][0-9]*)\.?(?=$|[\s,;])',
+    re.IGNORECASE,
+)
+
+
+def _action_number(text: str) -> str | None:
+    """Lee una elección clara y comprueba que no contradiga otra."""
+    lines = text.strip().splitlines()
+    choices = set()
+    has_complete_choice = False
+    for line in lines:
+        line = line.strip()
+        if line.startswith('**') and line.endswith('**'):
+            line = line[2:-2].strip()
+        match = _ACTION_REPLY.match(line)
+        if match is None or (len(lines) > 1 and match['label'] is None):
+            continue
+        choices.add(match['number'])
+        has_complete_choice = has_complete_choice or match.end() == len(line)
+    if has_complete_choice and len(choices) == 1:
+        return choices.pop()
+    return None
+
+
 def _choose_action(ask, turn, game, observation):
     actor = observation['miner_id']
     legal = observation['legal_actions']
@@ -164,8 +191,8 @@ def _choose_action(ask, turn, game, observation):
     for phase in ('act', 'revise-action'):
         text = _query(ask, choice['calls'], phase, observation,
                       feedback=feedback, previous_response=previous)
-        number = text.strip()
-        if not re.fullmatch(r'[1-9][0-9]*', number):
+        number = _action_number(text)
+        if number is None:
             feedback = 'La respuesta debe ser un único entero positivo.'
         elif len(number) > len(str(len(legal))) or int(number) > len(legal):
             feedback = f'El número debe estar entre 1 y {len(legal)}.'

@@ -44,6 +44,63 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(queries[-1]['observation']['public_actions'][0]['turn'], 1)
         self.assertEqual(len(queries[-1]['observation']['public_messages']), 47 * 5)
 
+    def test_applies_a_clear_choice_in_different_reply_formats(self):
+        replies = (
+            ' 1\n',
+            '1.',
+            'Elijo la opción 1.',
+            'La respuesta correcta es 1.',
+            'Respuesta: 1\nColocaré el túnel largo.',
+            '2. place\nRespuesta: 1',
+            'La elección de acción legal es:\n\n1. place\n\n'
+            'Colocaré el túnel largo "c012" en la posición (x, y) = (-1, 0), '
+            'con una rotación de 180°.\n\nRespuesta: 1',
+        )
+        for reply in replies:
+            with self.subTest(reply=reply):
+                def model(query):
+                    if query['observation']['turn'] == 2:
+                        raise KeyboardInterrupt
+                    if query['phase'] == 'speak':
+                        return ModelReply('SILENCIO')
+                    return ModelReply(reply)
+
+                episode = run_game(model, seed=11, conversation_seed=21, episode='reply-formats')
+                action = episode['turns'][0]['action']
+                self.assertEqual([call['reply']['text'] for call in action['calls']], [reply])
+                self.assertTrue(action['validations'][0]['accepted'])
+                self.assertEqual(episode['game']['attempts'][0]['request'],
+                                 {'kind': 'place', 'card_id': 'c012', 'x': -1, 'y': 0, 'rotation': 180})
+
+    def test_requests_correction_when_the_reply_does_not_identify_a_legal_choice(self):
+        replies = (
+            'Puedo ir a (1, 0) con giro de 180°.',
+            'Elijo la opción 1 o 2.',
+            'Elijo la opción 2.\nRespuesta: 1',
+            'Elijo la opción 2, porque encaja.\nRespuesta: 1',
+            '**Respuesta: 2**\nRespuesta: 1',
+            'Puedo elegir varias opciones.\n1.',
+            'Respuesta: 1.2',
+            'Respuesta: 21',
+        )
+        for reply in replies:
+            with self.subTest(reply=reply):
+                def model(query):
+                    if query['observation']['turn'] == 2:
+                        raise KeyboardInterrupt
+                    if query['phase'] == 'speak':
+                        return ModelReply('SILENCIO')
+                    if query['phase'] == 'act':
+                        return ModelReply(reply)
+                    self.assertEqual(query['previous_response'], reply)
+                    self.assertTrue(query['feedback'])
+                    return ModelReply('La respuesta correcta es 1.')
+
+                episode = run_game(model, seed=11, conversation_seed=21, episode='reply-retry')
+                action = episode['turns'][0]['action']
+                self.assertEqual([item['accepted'] for item in action['validations']], [False, True])
+                self.assertEqual(episode['game']['attempts'][0]['request']['kind'], 'place')
+
     def test_revises_long_messages_and_discards_first_card_after_two_invalid_actions(self):
         long_message = ' '.join(f'palabra{i}' for i in range(1, 82))
         queries = []
