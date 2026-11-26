@@ -1,4 +1,4 @@
-"""Ejecuta una partida de demostración con respuestas simuladas."""
+"""Ejecuta una partida de SaboteurAI con Ollama local o respuestas simuladas."""
 
 import argparse
 from pathlib import Path
@@ -19,35 +19,60 @@ def _demo_model(query: ModelQuery) -> ModelReply:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--demo', action='store_true', required=True,
-                        help='usar respuestas simuladas')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--demo', action='store_true', help='usar respuestas simuladas')
+    mode.add_argument('--model', metavar='MODELO', default='llama3.1:8b',
+                      help='modelo local (por defecto: %(default)s)')
     parser.add_argument('--seed', type=int, default=11, help='semilla de preparación')
     parser.add_argument('--conversation-seed', type=int, default=21,
                         help='semilla de conversación')
     args = parser.parse_args()
 
+    if args.demo:
+        ask_model = _demo_model
+        settings = ModelSettings('simulation', 'first-legal', {})
+        description = 'Partida de demostración con respuestas simuladas.'
+    else:
+        try:
+            from .ollama_model import OllamaModel
+        except ModuleNotFoundError as error:
+            if error.name not in ('ollama', 'httpx'):
+                raise
+            parser.error('instala las dependencias con python -m pip install -r requirements.txt')
+        ask_model = OllamaModel(args.model)
+        settings = ask_model.settings
+        description = f'Partida con Ollama local ({settings.name}).'
+
     directory = Path(mkdtemp(prefix='saboteurai-')).resolve()
     path = directory / 'episode.json'
-    print('Partida de demostración con respuestas simuladas. Ctrl+C detiene la ejecución.')
+    print(f'{description} Ctrl+C detiene la ejecución.')
     print(f'Registro privado: {path}')
     print(LEGEND, flush=True)
     stop_requested = False
+    querying_model = False
 
     def request_stop(_signum, _frame):
         nonlocal stop_requested
         stop_requested = True
+        if querying_model:
+            raise KeyboardInterrupt
 
     def ask(query: ModelQuery) -> ModelReply:
-        if stop_requested:
-            raise KeyboardInterrupt
-        return _demo_model(query)
+        nonlocal querying_model
+        try:
+            querying_model = True
+            if stop_requested:
+                raise KeyboardInterrupt
+            return ask_model(query)
+        finally:
+            querying_model = False
 
-    # Detiene la demo entre consultas y deja terminar la escritura del registro.
+    # Cancela una consulta en curso; deja terminar las transiciones y el guardado.
     previous_handler = signal.signal(signal.SIGINT, request_stop)
     try:
         record = run_game(
             ask, seed=args.seed, conversation_seed=args.conversation_seed,
-            episode=uuid4().hex, model_settings=ModelSettings('simulation', 'first-legal', {}),
+            episode=uuid4().hex, model_settings=settings,
             notify=show_event,
         )
         save_episode(record, path)
