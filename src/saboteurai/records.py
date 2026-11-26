@@ -1,5 +1,6 @@
-"""Registro exclusivo del evaluador. No es un contexto para jugadores."""
+"""Registro privado del evaluador y proyección de la información de cada minero."""
 
+from collections.abc import Sequence
 from copy import deepcopy
 import json
 import os
@@ -7,11 +8,12 @@ from pathlib import Path
 import platform
 import stat
 import tempfile
+from typing import TypedDict
 
 from .cards import Card, CARDS
 from .state import GameState, PlayerState, Tile, ENGINE_VERSION
 from .board import hidden, reachable_ports
-from .engine import apply_action, interrupt_game, is_json, INTERRUPTION_CODES
+from .engine import apply_action, interrupt_game, is_json, legal_actions, INTERRUPTION_CODES
 
 
 def _copy_json(value):
@@ -297,6 +299,62 @@ def _last_state(record):
     return read_state(record['attempts'][-1]['state'] if record['attempts'] else record['initial_state'])
 
 
+class PublicMessage(TypedDict):
+    turn: int
+    speaker: int
+    text: str
+
+
+def miner_view(
+    record: dict, miner_id: int, *, public_messages: Sequence[PublicMessage] = (),
+) -> dict:
+    """Devuelve la observación JSON del minero al final del registro.
+
+    public_messages contiene solo las intervenciones ya publicadas en esta
+    partida, en el orden en que se publicaron, incluidas las del turno en curso.
+    public_actions incluye los efectos públicos de cada acción aplicada.
+    Las inspecciones previas al inicio del registro llevan un turno nulo.
+    """
+    state = _last_state(record)
+    if type(miner_id) is not int or miner_id not in range(len(state.players)):
+        raise ValueError('Identificador de minero inválido')
+    miner = state.players[miner_id]
+    if miner.role != 'miner':
+        raise ValueError('El jugador no es un minero')
+
+    initial_miner = record['initial_state']['players'][miner_id]
+    inspections = [
+        {'turn': None, 'x': item['x'], 'y': item['y'], 'type': item['type']}
+        for item in initial_miner['inspections']
+    ]
+    public_actions: list[dict] = []
+    for entry in record['attempts']:
+        if entry['operation'] != 'action' or not entry['accepted']:
+            continue
+        turn = entry['turn']
+        public_actions.extend(dict(turn=turn, **deepcopy(event)) for event in entry['public_events'])
+        inspections.extend(
+            {'turn': turn, 'x': event['x'], 'y': event['y'], 'type': event['type']}
+            for event in entry['private_events'].get(str(miner_id), ())
+            if event['kind'] == 'inspection'
+        )
+
+    return {
+        'miner_id': miner_id,
+        'turn': state.turn,
+        'active': state.active if state.status == 'playing' else None,
+        'status': state.status,
+        'board': public_board(state),
+        'players': [{'id': p.id, 'pick_ok': p.pick_ok} for p in state.players],
+        'hand': [_card(card) for card in miner.hand],
+        'inspections': inspections,
+        'legal_actions': legal_actions(state, miner_id),
+        'public_actions': public_actions,
+        'public_messages': [PublicMessage(turn=msg['turn'], speaker=msg['speaker'], text=msg['text'])
+                            for msg in public_messages],
+    }
+
+
 def _format_description(value):
     # No repr, nombres de clases externas ni contenido de objetos no JSON.
     if type(value) is dict:
@@ -321,20 +379,20 @@ def record_attempt(record, actor, request):
              'public_events': deepcopy(resolution.public_events),
              'private_events': {str(k): deepcopy(v) for k, v in resolution.private_events.items()},
              'state': state_data(resolution.state)}
-    record['attempts'].append(entry)
-    record['closure'] = _closure(resolution.state)
+    # Publica transición y cierre juntos ante una interrupción manual.
+    record.update(attempts=[*record['attempts'], entry], closure=_closure(resolution.state))
     return resolution
 
 
 def record_interruption(record, code):
     state = _last_state(record)
     interrupted = interrupt_game(state, code)
-    record['attempts'].append({
+    entry = {
         'sequence': len(record['attempts']) + 1, 'turn': state.turn,
         'operation': 'interrupt', 'code': code,
         'events': [{'kind': 'interruption', 'code': code}],
-        'state': state_data(interrupted)})
-    record['closure'] = _closure(interrupted)
+        'state': state_data(interrupted)}
+    record.update(attempts=[*record['attempts'], entry], closure=_closure(interrupted))
     return interrupted
 
 
@@ -428,6 +486,21 @@ def save_record(record, path):
             raise ValueError('No sobrescribir otro episodio')
         if not _same_json(previous['attempts'], record['attempts'][:len(previous['attempts'])]):
             raise ValueError('No perder ni sustituir trayectoria confirmada')
+    _write_private_text(payload, path, replace=True)
+
+
+def save_episode(episode, path):
+    """Guarda la evidencia privada de una partida sin sobrescribir archivos."""
+    path = _private_path(path)
+    _keys(episode, 'format game turns configuration error')
+    if episode['format'] != 'episode-v1' or not replay_record(episode['game'])['matches']:
+        raise ValueError('Episodio incompatible')
+    # El texto del modelo puede contener caracteres sin representación directa en UTF-8.
+    payload = json.dumps(episode, ensure_ascii=True, allow_nan=False, separators=(',', ':'))
+    _write_private_text(payload, path, replace=False)
+
+
+def _write_private_text(payload, path, *, replace):
     temporary = None
     try:
         fd, temporary = tempfile.mkstemp(prefix='.record-', dir=path.parent)
@@ -437,7 +510,10 @@ def save_record(record, path):
             stream.flush()
             os.fsync(stream.fileno())
         _private_path(path)
-        os.replace(temporary, path)
+        if replace:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
     finally:
         if temporary is not None and os.path.exists(temporary):
             os.unlink(temporary)

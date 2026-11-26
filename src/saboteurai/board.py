@@ -11,11 +11,19 @@ def hidden(tile):
     return CARDS[tile.card.type].kind == 'goal' and not tile.revealed
 
 
-def groups_for(tile):
-    if type(tile.rotation) is not int or tile.rotation not in (0, 180):
+def _oriented_groups(card_type: str, rotation: int) -> tuple[tuple[str, ...], ...]:
+    if type(rotation) is not int or rotation not in (0, 180):
         raise ValueError('rotation debe ser 0 o 180')
-    return tuple(tuple(OPPOSITE[e] if tile.rotation == 180 else e for e in group)
-                 for group in CARDS[tile.card.type].groups)
+    return tuple(tuple(OPPOSITE[e] if rotation == 180 else e for e in group)
+                 for group in CARDS[card_type].groups)
+
+
+def groups_for(tile):
+    return _oriented_groups(tile.card.type, tile.rotation)
+
+
+def port_notation(card_type: str, rotation: int = 0) -> str:
+    return '/'.join(''.join(group) for group in _oriented_groups(card_type, rotation))
 
 
 def edges_for(tile):
